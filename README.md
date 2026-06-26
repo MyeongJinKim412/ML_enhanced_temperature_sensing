@@ -1,8 +1,8 @@
-# Machine Learning-Enhanced Temperature Sensing of Temperature-Insensitive Fluorophores
+# Machine Learning-Enhanced Temperature Sensing of Spectrally Featureless Fluorophores
 
 # Supporting Information
 
-This repository contains the implementation code for the research paper "Machine Learning-Enhanced Temperature Sensing of Temperature-Insensitive Fluorophores" by Myeong Jin Kim and Jong Woo Lee.
+This repository contains the implementation code for the research paper "Machine Learning-Enhanced Temperature Sensing of Spectrally Featureless Fluorophores" by Myeong Jin Kim and Jong Woo Lee.
 
 This study demonstrates how machine learning algorithms can enhance temperature sensing using fluorescence spectroscopy, particularly with temperature-insensitive fluorophores like resveratrone. By extracting spectral features and applying various ML models, we achieved significant improvements in temperature prediction accuracy.
 
