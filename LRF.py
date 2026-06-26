@@ -8,9 +8,9 @@ import os
 import random
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import DecisionTreeRegressor
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import r2_score, mean_absolute_error
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import RobustScaler, StandardScaler, MinMaxScaler, Normalizer
 from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
@@ -76,7 +76,12 @@ class LinearDecisionTree:
             # Apply linear model
             if len(X_leaf) >= 2:  # Minimum 2 samples required
                 try:
-                    linear_model = LinearRegression()
+                    # Ridge regression instead of OLS to prevent coefficient
+                    # explosion caused by near-singular leaf matrices when
+                    # sample count is small (especially during k-fold CV).
+                    # alpha=1.0 provides mild regularization consistent with
+                    # the L2 strength used in the MLP model.
+                    linear_model = Ridge(alpha=1.0)
                     linear_model.fit(X_leaf, y_leaf)
                     self.linear_models[leaf_id] = linear_model
                 except:
@@ -104,6 +109,11 @@ class LinearDecisionTree:
                 # Use default tree prediction
                 predictions[i] = self.tree.predict(X[i:i+1])[0]
         
+        # Clip predictions to the physical temperature range (25–70 °C).
+        # Prevents numerically unstable leaf models from producing
+        # wildly extrapolated values, especially in k-fold CV folds
+        # whose validation set extends near the boundary of the training range.
+        predictions = np.clip(predictions, 25.0, 70.0)
         return predictions
 
 class ApproximateLinearRandomForest:
@@ -577,10 +587,55 @@ model_info = lrf_model.get_model_info()
 print(f"Average Tree Training Score: {model_info['avg_train_score']:.4f}")
 print(f"Average Tree Pruning Score: {model_info['avg_prune_score']:.4f}")
 
-# Internal performance evaluation
-print("\n[Training/Validation Results]")
-print_metrics("Training", y_train, lrf_model.predict(X_train_final))
-print_metrics("Validation", y_val, lrf_model.predict(X_val_final))
+# (Training/Validation split metrics not reported; K-Fold CV is the sole internal evaluation)
+
+# ─────────────────────────────────────────────
+# 5-Fold Cross-Validation (sole reported internal evaluation metric)
+# Performed on the full dataset (X, y).
+# LRF re-instantiated with identical hyperparameters per fold.
+# Per-fold StandardScaler fitting prevents data leakage.
+# Reference: Hastie et al., The Elements of Statistical Learning,
+#            2nd ed., Springer, 2009, Ch. 7.
+# ─────────────────────────────────────────────
+print("\n" + "="*60)
+print("5-Fold Cross-Validation (LRF)")
+print("="*60)
+
+X_arr = X.values
+y_arr = y.values
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+cv_mae_list = []
+cv_r2_list  = []
+
+for fold, (tr_idx, val_idx) in enumerate(kf.split(X_arr), start=1):
+    X_tr, X_vl = X_arr[tr_idx], X_arr[val_idx]
+    y_tr, y_vl = y_arr[tr_idx], y_arr[val_idx]
+
+    fold_scaler = StandardScaler()
+    X_tr_sc = fold_scaler.fit_transform(X_tr)
+    X_vl_sc = fold_scaler.transform(X_vl)
+
+    fold_model = ApproximateLinearRandomForest(
+        n_estimators=100,
+        max_depth=5,
+        min_samples_split=10,
+        min_samples_leaf=5,
+        max_features='sqrt',
+        random_state=42
+    )
+    fold_model.fit(X_tr_sc, y_tr)
+
+    y_vl_pred = fold_model.predict(X_vl_sc)
+    fold_mae  = mean_absolute_error(y_vl, y_vl_pred)
+    fold_r2   = r2_score(y_vl, y_vl_pred)
+    cv_mae_list.append(fold_mae)
+    cv_r2_list.append(fold_r2)
+    print(f"  Fold {fold}: MAE = {fold_mae:.4f} °C,  R² = {fold_r2:.4f}")
+
+print(f"\n  Mean MAE = {np.mean(cv_mae_list):.4f} ± {np.std(cv_mae_list, ddof=1):.4f} °C  (mean ± SD, k=5)")
+print(f"  Mean R²  = {np.mean(cv_r2_list):.4f} ± {np.std(cv_r2_list,  ddof=1):.4f}       (mean ± SD, k=5)")
+print("="*60)
 
 # 6. Visualization
 print("\n[Step 6: Visualization]")
