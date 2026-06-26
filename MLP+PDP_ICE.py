@@ -8,7 +8,7 @@ import os
 import random
 from sklearn.neural_network import MLPRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.inspection import partial_dependence, PartialDependenceDisplay
 import matplotlib.pyplot as plt
@@ -608,6 +608,60 @@ def print_detailed_metrics(name, y_true, y_pred):
 
 print_detailed_metrics("Training", y_train, model.predict(X_train_scaled))
 print_detailed_metrics("Validation", y_val, model.predict(X_val_scaled))
+
+# ─────────────────────────────────────────────
+# 5-Fold Cross-Validation (added for reviewer robustness check)
+# PyramidMLPRegressor is re-instantiated with identical hyperparameters
+# inside each fold.  Scaler is re-fitted per fold to prevent leakage.
+# Early stopping uses an internal 10 % split of the fold-train set
+# (validation_fraction=0.1), consistent with the main model.
+# Reference: Hastie et al., The Elements of Statistical Learning,
+#            2nd ed., Springer, 2009, Ch. 7.
+# ─────────────────────────────────────────────
+print("\n" + "="*60)
+print("5-Fold Cross-Validation (Pyramid MLP)")
+print("="*60)
+
+X_arr = X.values
+y_arr = y.values
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+cv_mae_list = []
+cv_r2_list  = []
+
+for fold, (tr_idx, val_idx) in enumerate(kf.split(X_arr), start=1):
+    X_tr, X_vl = X_arr[tr_idx], X_arr[val_idx]
+    y_tr, y_vl = y_arr[tr_idx], y_arr[val_idx]
+
+    fold_scaler = StandardScaler()
+    X_tr_sc = fold_scaler.fit_transform(X_tr)
+    X_vl_sc = fold_scaler.transform(X_vl)
+
+    fold_model = MLPRegressor(
+        hidden_layer_sizes=(256, 128, 64, 32, 16),
+        activation='relu',
+        alpha=0.01,
+        batch_size=32,
+        learning_rate_init=0.01,
+        max_iter=2000,
+        early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=20,
+        random_state=42,
+        shuffle=True
+    )
+    fold_model.fit(X_tr_sc, y_tr)
+
+    y_vl_pred = fold_model.predict(X_vl_sc)
+    fold_mae  = mean_absolute_error(y_vl, y_vl_pred)
+    fold_r2   = r2_score(y_vl, y_vl_pred)
+    cv_mae_list.append(fold_mae)
+    cv_r2_list.append(fold_r2)
+    print(f"  Fold {fold}: MAE = {fold_mae:.4f} °C,  R² = {fold_r2:.4f}")
+
+print(f"\n  Mean MAE = {np.mean(cv_mae_list):.4f} ± {np.std(cv_mae_list, ddof=1):.4f} °C  (mean ± SD, k=5)")
+print(f"  Mean R²  = {np.mean(cv_r2_list):.4f} ± {np.std(cv_r2_list,  ddof=1):.4f}       (mean ± SD, k=5)")
+print("="*60)
 
 # MLP PDP/ICE Analysis
 print("\n" + "="*90)
