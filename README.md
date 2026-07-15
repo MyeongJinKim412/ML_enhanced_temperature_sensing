@@ -11,6 +11,7 @@ This study demonstrates how machine learning algorithms can enhance temperature 
 - **SVR**: Support Vector Regression with RBF/polynomial kernels
 - **LRF**: Linear Random Forest with linear models at leaf nodes
 - **MLP+PDP_ICE**: Multilayer Perceptron with pyramid architecture. PDP and ICE analytics also run together.
+- **PCR+PLSR+Ridge**
 
 ## Dataset
 Temperature range: 25-70°C
