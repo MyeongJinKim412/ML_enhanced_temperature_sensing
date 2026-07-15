@@ -1,6 +1,6 @@
 # Machine Learning-Enhanced Temperature Sensing of Spectrally Featureless Fluorophores
 
-# Supporting Information
+# Supplementary Material
 
 This repository contains the implementation code for the research paper "Machine Learning-Enhanced Temperature Sensing of Spectrally Featureless Fluorophores" by Myeong Jin Kim and Jong Woo Lee.
 
