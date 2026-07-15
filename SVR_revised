@@ -1,0 +1,375 @@
+"""
+Support Vector Regression (SVR) temperature prediction pipeline.
+
+Workflow
+--------
+1. Select training/validation CSV files (excitation/emission spectra).
+2. Extract five spectral descriptors per measurement set.
+3. Grid-search RBF and polynomial kernel SVR hyperparameters
+   (5-fold CV, R2 scoring) on standardized (Z-score) features.
+4. Run 5-fold cross-validation with each kernel's best hyperparameters
+   (per-fold scaler fitting to avoid data leakage; Hastie et al., The
+   Elements of Statistical Learning, 2nd ed., Springer, 2009, Ch. 7).
+5. Evaluate both kernels on a held-out test set and export predictions.
+"""
+
+import os
+import re
+import random
+import warnings
+import tkinter as tk
+from tkinter.filedialog import askopenfilenames, asksaveasfilename
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import GridSearchCV, KFold, train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
+
+warnings.filterwarnings("ignore")
+
+RANDOM_STATE = 42
+random.seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
+
+FEATURE_COLUMNS = [
+    "Excitation_ratio",
+    "EmScan_peak_eV",
+    "Em1_peak_eV",
+    "Em2_peak_eV",
+    "Intensity_400nm_div_shoulder",
+]
+
+KERNELS = ["rbf", "poly"]
+PARAM_GRIDS = {
+    "rbf": {
+        "C": [0.1, 1, 10, 100],
+        "epsilon": [0.01, 0.1, 0.2, 0.5],
+        "gamma": ["scale", 0.001, 0.01, 0.1, 1],
+    },
+    "poly": {
+        "C": [0.1, 1, 10, 100],
+        "epsilon": [0.01, 0.1, 0.2, 0.5],
+        "gamma": ["scale", 0.001, 0.01, 0.1],
+        "degree": [2, 3, 4],
+    },
+}
+
+
+# ---------- File selection ----------
+def select_files(title):
+    root = tk.Tk()
+    root.withdraw()
+    files = askopenfilenames(title=title, filetypes=[("CSV files", "*.csv")])
+    root.destroy()
+    return sorted(files)
+
+
+# ---------- Raw data parsing ----------
+def read_xy(file):
+    try:
+        df = pd.read_csv(file, header=0, encoding="utf-8")
+    except UnicodeDecodeError:
+        df = pd.read_csv(file, header=0, encoding="cp949")
+    except Exception as e:
+        print(f"File reading error: {file} - {e}")
+        return np.array([]), np.array([])
+
+    if df.shape[1] < 4:
+        print(f"File format error: {file} - insufficient columns")
+        return np.array([]), np.array([])
+
+    x = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+    y = pd.to_numeric(df.iloc[:, 3], errors="coerce")
+    valid = ~(np.isnan(x) | np.isnan(y))
+    return x[valid].values, y[valid].values
+
+
+def parse_info(file_name):
+    """Extract (set_name, temperature) from a filename, e.g. 'Set1_25.0C'."""
+    m = re.search(r"(Set\d+).*?([0-9]+(?:\.[0-9]+)?)\s*[°º]?\s*[C℃]", file_name)
+    return (m.group(1), float(m.group(2))) if m else ("Unknown", np.nan)
+
+
+# ---------- Spectral descriptor extraction ----------
+def extract_peak_ev(x, y):
+    if len(x) == 0 or len(y) == 0:
+        return np.nan
+    idx = np.argmax(y)
+    return 1240 / x[idx] if x[idx] > 0 else np.nan
+
+
+def extract_ex_ratio(x, y):
+    if len(x) == 0 or len(y) == 0:
+        return np.nan
+    main_mask = (x >= 370) & (x <= 380)
+    shoulder_mask = (x >= 340) & (x <= 350)
+    if not main_mask.any() or not shoulder_mask.any():
+        return np.nan
+    main_max = np.max(y[main_mask])
+    return np.max(y[shoulder_mask]) / main_max if main_max != 0 else np.nan
+
+
+def extract_ratio_400_shoulder(em_x, em_y, ex_x, ex_y):
+    if len(ex_x) == 0 or len(ex_y) == 0 or len(em_y) == 0:
+        return np.nan
+    mask = (340 <= ex_x) & (ex_x <= 350)
+    if not mask.any():
+        return np.nan
+    em_max = np.max(em_y)
+    return np.max(ex_y[mask]) / em_max if em_max != 0 else np.nan
+
+
+# ---------- Dataset construction (shared by train/val and test sets) ----------
+def build_dataset(paths, include_set=False):
+    """Match each EmScan file to its ExScan/Em(1)/Em(2) counterparts (same
+    set, temperature within 0.2 degC) and compute the five descriptors."""
+    records = []
+    for file in paths:
+        set_name, temp = parse_info(file)
+        if "EmScan" not in file or set_name == "Unknown":
+            continue
+
+        related = lambda tag: [f for f in paths if tag in f and set_name in f]
+        f_ex = next((f for f in related("ExScan") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+        f_em1 = next((f for f in related("Em(1)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+        f_em2 = next((f for f in related("Em(2)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+        if not all([f_ex, f_em1, f_em2]):
+            print(f"{set_name} - Missing related files")
+            continue
+
+        x_em, y_em = read_xy(file)
+        x_ex, y_ex = read_xy(f_ex)
+        x_em1, y_em1 = read_xy(f_em1)
+        x_em2, y_em2 = read_xy(f_em2)
+        if any(len(a) == 0 for a in [x_em, y_em, x_ex, y_ex, x_em1, y_em1, x_em2, y_em2]):
+            print(f"{set_name} - Data reading failed")
+            continue
+
+        temps = [temp, parse_info(f_ex)[1], parse_info(f_em1)[1], parse_info(f_em2)[1]]
+        T_avg = round(np.mean(temps), 2)
+
+        row = {
+            "Temperature": T_avg,
+            "Excitation_ratio": extract_ex_ratio(x_ex, y_ex),
+            "EmScan_peak_eV": extract_peak_ev(x_em, y_em),
+            "Em1_peak_eV": extract_peak_ev(x_em1, y_em1),
+            "Em2_peak_eV": extract_peak_ev(x_em2, y_em2),
+            "Intensity_400nm_div_shoulder": extract_ratio_400_shoulder(x_em, y_em, x_ex, y_ex),
+        }
+        if include_set:
+            row = {"Set": set_name, **row}
+
+        if not any(np.isnan(row[c]) for c in FEATURE_COLUMNS):
+            records.append(row)
+        else:
+            print(f"{set_name} - Feature calculation failed (contains NaN values)")
+
+    return pd.DataFrame(records)
+
+
+# ---------- Scaling info ----------
+def print_scaling_info(scaler, feature_names):
+    print("\nStandard Scaling (Z-score) information:")
+    for i, feature in enumerate(feature_names):
+        print(f"  {feature}: Mean = {scaler.mean_[i]:.4f}, Std = {scaler.scale_[i]:.4f}")
+
+
+# ---------- Hyperparameter tuning ----------
+def tune_svr_hyperparameters(X_train, y_train):
+    """Grid-search SVR hyperparameters for each kernel; return the best
+    model per kernel plus the overall best kernel."""
+    print("\n[Starting SVR Hyperparameter Tuning...]")
+    print("This process may take some time...")
+
+    best_models, best_scores = {}, {}
+    for kernel in KERNELS:
+        print(f"\nTuning {kernel.upper()} kernel...")
+        try:
+            grid_search = GridSearchCV(
+                SVR(kernel=kernel), PARAM_GRIDS[kernel], cv=5, scoring="r2", n_jobs=-1
+            )
+            grid_search.fit(X_train, y_train)
+            best_models[kernel] = grid_search.best_estimator_
+            best_scores[kernel] = grid_search.best_score_
+            print(f"{kernel.upper()} optimal parameters: {grid_search.best_params_}")
+            print(f"{kernel.upper()} CV R2 score: {grid_search.best_score_:.4f}")
+        except Exception as e:
+            print(f"{kernel.upper()} kernel tuning failed: {e}")
+            best_models[kernel] = SVR(kernel=kernel).fit(X_train, y_train)
+            best_scores[kernel] = 0.0
+
+    if not best_models:
+        raise ValueError("Tuning failed for all kernels.")
+
+    best_kernel = max(best_scores, key=best_scores.get)
+    print(f"\nBest performing kernel: {best_kernel.upper()}")
+    print(f"Best CV R2 score: {best_scores[best_kernel]:.4f}")
+    return best_models, best_scores, best_kernel
+
+
+# ---------- Cross-validation ----------
+def run_cross_validation(best_models, X, y, n_splits=5):
+    """5-fold CV per kernel using its tuned hyperparameters, with per-fold
+    StandardScaler fitting (train fold only) to prevent data leakage."""
+    print("\n" + "=" * 60)
+    print("5-Fold Cross-Validation (SVR)")
+    print("=" * 60)
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+
+    for kernel in KERNELS:
+        if kernel not in best_models:
+            continue
+        params = best_models[kernel].get_params()
+        shown = {k: params[k] for k in ("C", "epsilon", "gamma") if k in params}
+        print(f"\n  [{kernel.upper()} kernel] best params: {shown}")
+
+        mae_list, r2_list = [], []
+        for fold, (tr_idx, val_idx) in enumerate(kf.split(X), start=1):
+            X_tr, X_vl = X[tr_idx], X[val_idx]
+            y_tr, y_vl = y[tr_idx], y[val_idx]
+
+            fold_scaler = StandardScaler()
+            X_tr_sc = fold_scaler.fit_transform(X_tr)
+            X_vl_sc = fold_scaler.transform(X_vl)
+
+            fold_model = SVR(**params).fit(X_tr_sc, y_tr)
+            y_vl_pred = fold_model.predict(X_vl_sc)
+
+            fold_mae = mean_absolute_error(y_vl, y_vl_pred)
+            fold_r2 = r2_score(y_vl, y_vl_pred)
+            mae_list.append(fold_mae)
+            r2_list.append(fold_r2)
+            print(f"    Fold {fold}: MAE = {fold_mae:.4f} °C,  R² = {fold_r2:.4f}")
+
+        print(f"  Mean MAE = {np.mean(mae_list):.4f} ± {np.std(mae_list, ddof=1):.4f} °C  (mean ± SD, k={n_splits})")
+        print(f"  Mean R²  = {np.mean(r2_list):.4f} ± {np.std(r2_list, ddof=1):.4f}       (mean ± SD, k={n_splits})")
+
+    print("=" * 60)
+
+
+# ---------- Test evaluation & export ----------
+def evaluate_on_test(best_models, X_test_scaled, y_test):
+    print("\n[Test Performance Comparison]")
+    print("-" * 70)
+    test_results = {}
+    for kernel, model in best_models.items():
+        try:
+            y_pred = model.predict(X_test_scaled)
+            test_results[kernel] = {
+                "r2": r2_score(y_test, y_pred),
+                "mae": mean_absolute_error(y_test, y_pred),
+                "rmse": np.sqrt(mean_squared_error(y_test, y_pred)),
+                "predictions": y_pred,
+            }
+            r = test_results[kernel]
+            print(f"{kernel.upper():>8} | R2: {r['r2']:.4f} | MAE: {r['mae']:.4f} | RMSE: {r['rmse']:.4f}")
+        except Exception as e:
+            print(f"{kernel.upper()} test prediction error: {e}")
+            test_results[kernel] = {
+                "r2": np.nan, "mae": np.nan, "rmse": np.nan,
+                "predictions": np.full(len(y_test), np.nan),
+            }
+    print("-" * 70)
+    return test_results
+
+
+def save_test_results(df_test, y_test, test_results):
+    for kernel in KERNELS:
+        if kernel not in test_results:
+            continue
+        pred = test_results[kernel]["predictions"]
+
+        out = df_test.copy()
+        out[f"Predicted_Temperature_{kernel}"] = pred
+        out[f"Residual_{kernel}"] = y_test - pred
+        out[f"Abs_Residual_{kernel}"] = (y_test - pred).abs()
+        out[f"R2_Score_{kernel}"] = test_results[kernel]["r2"]
+        out[f"MAE_{kernel}"] = test_results[kernel]["mae"]
+        out[f"RMSE_{kernel}"] = test_results[kernel]["rmse"]
+        out["Kernel"] = kernel
+
+        root = tk.Tk()
+        root.withdraw()
+        save_path = asksaveasfilename(
+            title=f"Save SVR {kernel.upper()} Kernel Test Results",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            initialfile=f"svr_test_results_{kernel}_scaled.csv",
+        )
+        root.destroy()
+
+        if save_path and not os.path.isdir(save_path):
+            out.to_csv(save_path, index=False)
+            print(f"SVR {kernel.upper()} kernel test results saved: {save_path}")
+        else:
+            print(f"{kernel.upper()} kernel results save skipped")
+
+
+# ---------- Main ----------
+def main():
+    print("Select training and validation data files...")
+    train_val_paths = select_files("Select training and validation data files")
+    if not train_val_paths:
+        print("No files selected.")
+        return
+    print(f"{len(train_val_paths)} files selected.")
+
+    df = build_dataset(train_val_paths, include_set=True)
+    if df.empty:
+        print("No valid data available for model training.")
+        return
+    print(f"Final dataset: {len(df)} samples")
+
+    X = df[FEATURE_COLUMNS]
+    y = df["Temperature"]
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
+    print(f"Training data: {len(X_train)}, Validation data: {len(X_val)}")
+
+    print("\n[Applying Standard Scaling (Z-score) for SVR...]")
+    print("SVR is a distance-based algorithm, so feature scaling is essential.")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    print_scaling_info(scaler, FEATURE_COLUMNS)
+
+    best_models, best_scores, best_kernel = tune_svr_hyperparameters(X_train_scaled, y_train)
+
+    run_cross_validation(best_models, X.values, y.values)
+
+    print("\nSelect test data files...")
+    test_paths = select_files("Select test data files")
+    if not test_paths:
+        print("No test files selected.")
+        return
+
+    df_test = build_dataset(test_paths, include_set=False)
+    if df_test.empty:
+        print("No valid test data available.")
+        return
+
+    X_test = df_test[FEATURE_COLUMNS]
+    y_test = df_test["Temperature"]
+    X_test_scaled = scaler.transform(X_test)
+    print("\nStandard Scaling applied to test data")
+
+    test_results = evaluate_on_test(best_models, X_test_scaled, y_test)
+
+    print("\nTest performance summary by kernel:")
+    for kernel in KERNELS:
+        if kernel in test_results:
+            r = test_results[kernel]
+            print(f"{kernel.upper()} kernel: R2 = {r['r2']:.4f}, MAE = {r['mae']:.4f}, RMSE = {r['rmse']:.4f}")
+
+    save_test_results(df_test, y_test, test_results)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\nError occurred during program execution: {e}")
+        print("Please check error details and verify data files.")
+        import traceback
+        traceback.print_exc()
