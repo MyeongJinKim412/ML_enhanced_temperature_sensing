@@ -1,0 +1,270 @@
+import os
+import re
+import random
+import tkinter as tk
+from tkinter import filedialog
+from tkinter.filedialog import askopenfilenames, asksaveasfilename
+
+import numpy as np
+import pandas as pd
+from scipy.stats import pearsonr
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.preprocessing import StandardScaler
+
+RANDOM_STATE = 42
+random.seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
+
+FEATURE_COLUMNS = [
+    "Excitation_ratio",
+    "EmScan_peak_eV",
+    "Em1_peak_eV",
+    "Em2_peak_eV",
+    "Intensity_400nm_div_shoulder",
+]
+
+
+# ---------- File selection ----------
+def select_files(title):
+    root = tk.Tk()
+    root.withdraw()
+    files = askopenfilenames(title=title, filetypes=[("CSV files", "*.csv")])
+    return sorted(files)
+
+
+# ---------- Raw data parsing ----------
+def read_xy(file):
+    try:
+        df = pd.read_csv(file, header=0, encoding="utf-8")
+    except UnicodeDecodeError:
+        df = pd.read_csv(file, header=0, encoding="cp949")
+    x = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+    y = pd.to_numeric(df.iloc[:, 3], errors="coerce")
+    return x.dropna().values, y.dropna().values
+
+
+def parse_info(file_name):
+    """Extract (set_name, temperature) from a filename, e.g. 'Set1_25.0C'."""
+    m = re.search(r"(Set\d+).*?([0-9]+(?:\.[0-9]+)?)\s*[°º]?\s*[C℃]", file_name)
+    return (m.group(1), float(m.group(2))) if m else ("Unknown", np.nan)
+
+
+# ---------- Spectral descriptor extraction ----------
+def extract_peak_ev(x, y):
+    return 1240 / x[np.argmax(y)]
+
+
+def extract_ex_ratio(x, y):
+    main_mask = (x >= 370) & (x <= 380)
+    shoulder_mask = (x >= 340) & (x <= 350)
+    if not main_mask.any() or not shoulder_mask.any():
+        return np.nan
+    return np.max(y[shoulder_mask]) / np.max(y[main_mask])
+
+
+def extract_ratio_400_shoulder(em_x, em_y, ex_x, ex_y):
+    mask = (340 <= ex_x) & (ex_x <= 350)
+    if not mask.any():
+        return np.nan
+    return np.max(ex_y[mask]) / np.max(em_y)
+
+
+# ---------- Dataset construction (shared by train/val and test sets) ----------
+def build_dataset(paths, include_set=False):
+    """Match each EmScan file to its ExScan/Em(1)/Em(2) counterparts (same
+    set, temperature within 0.2 degC) and compute the five descriptors."""
+    records = []
+    for file in paths:
+        set_name, temp = parse_info(file)
+        if "EmScan" not in file or set_name == "Unknown":
+            continue
+
+        related = lambda tag: [f for f in paths if tag in f and set_name in f]
+        f_ex = next((f for f in related("ExScan") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+        f_em1 = next((f for f in related("Em(1)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+        f_em2 = next((f for f in related("Em(2)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+        if not all([f_ex, f_em1, f_em2]):
+            continue
+
+        x_em, y_em = read_xy(file)
+        x_ex, y_ex = read_xy(f_ex)
+        x_em1, y_em1 = read_xy(f_em1)
+        x_em2, y_em2 = read_xy(f_em2)
+
+        temps = [temp, parse_info(f_ex)[1], parse_info(f_em1)[1], parse_info(f_em2)[1]]
+        T_avg = round(np.mean(temps), 2)
+
+        row = {
+            "Temperature": T_avg,
+            "Excitation_ratio": extract_ex_ratio(x_ex, y_ex),
+            "EmScan_peak_eV": extract_peak_ev(x_em, y_em),
+            "Em1_peak_eV": extract_peak_ev(x_em1, y_em1),
+            "Em2_peak_eV": extract_peak_ev(x_em2, y_em2),
+            "Intensity_400nm_div_shoulder": extract_ratio_400_shoulder(x_em, y_em, x_ex, y_ex),
+        }
+        if include_set:
+            row = {"Set": set_name, **row}
+
+        if not any(np.isnan(row[c]) for c in FEATURE_COLUMNS):
+            records.append(row)
+
+    return pd.DataFrame(records)
+
+
+# ---------- Reporting helpers ----------
+def print_metrics(name, y_true, y_pred):
+    r2 = r2_score(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    print(f"{name} R2: {r2:.4f}, MAE: {mae:.4f}")
+
+
+def print_scaling_info(scaler, feature_names):
+    print("\nStandard Scaling (Z-score) information:")
+    for i, feature in enumerate(feature_names):
+        print(f"  {feature}: mean = {scaler.mean_[i]:.4f}, std = {scaler.scale_[i]:.4f}")
+
+
+def calculate_standardized_correlations(X_train, y_train, feature_names):
+    """Pearson correlation between each Z-scored feature and Z-scored target."""
+    print("\n[Standardized Correlation Coefficients]")
+    print("-" * 60)
+
+    X_std = (X_train - np.mean(X_train, axis=0)) / np.std(X_train, axis=0)
+    y_std = (y_train - np.mean(y_train)) / np.std(y_train)
+    X_std = X_std.values if hasattr(X_std, "values") else X_std
+
+    results = []
+    for i, col in enumerate(feature_names):
+        r, p = pearsonr(X_std[:, i], y_std)
+        results.append((col, r, p))
+        print(f"{col}: r_std = {r:.4f}, p-value = {p:.4f}")
+    print("-" * 60)
+    return results
+
+
+# ---------- Cross-validation ----------
+def run_cross_validation(X, y, n_splits=5):
+    """5-fold CV with per-fold StandardScaler fitting (train fold only) to
+    prevent data leakage. This is the sole reported internal evaluation
+    metric."""
+    print("\n" + "=" * 60)
+    print("5-Fold Cross-Validation (MLR)")
+    print("=" * 60)
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    mae_list, r2_list = [], []
+
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(X), start=1):
+        X_tr, X_vl = X[tr_idx], X[val_idx]
+        y_tr, y_vl = y[tr_idx], y[val_idx]
+
+        fold_scaler = StandardScaler()
+        X_tr_sc = fold_scaler.fit_transform(X_tr)
+        X_vl_sc = fold_scaler.transform(X_vl)
+
+        fold_model = LinearRegression().fit(X_tr_sc, y_tr)
+        y_vl_pred = fold_model.predict(X_vl_sc)
+
+        fold_mae = mean_absolute_error(y_vl, y_vl_pred)
+        fold_r2 = r2_score(y_vl, y_vl_pred)
+        mae_list.append(fold_mae)
+        r2_list.append(fold_r2)
+        print(f"  Fold {fold}: MAE = {fold_mae:.4f} °C,  R² = {fold_r2:.4f}")
+
+    print(f"\n  Mean MAE = {np.mean(mae_list):.4f} ± {np.std(mae_list, ddof=1):.4f} °C  (mean ± SD, k={n_splits})")
+    print(f"  Mean R²  = {np.mean(r2_list):.4f} ± {np.std(r2_list, ddof=1):.4f}       (mean ± SD, k={n_splits})")
+    print("=" * 60)
+
+
+# ---------- Output ----------
+def save_correlation_summary(standardized_correlations):
+    """Save standardized correlation coefficients (Feature, r_std, p-value)
+    to CSV, sorted by |r_std|."""
+    root = tk.Tk()
+    root.withdraw()
+    save_dir = filedialog.askdirectory(title="Select folder to save correlation summary")
+    if not save_dir:
+        print("ERROR: No save folder selected.")
+        return
+
+    corr_df = pd.DataFrame(standardized_correlations, columns=["Feature", "Std_Correlation", "P_value"])
+    corr_df["Abs_Correlation"] = corr_df["Std_Correlation"].abs()
+    corr_df = corr_df.sort_values("Abs_Correlation", ascending=False)
+
+    summary_file = os.path.join(save_dir, "correlation_summary_standard.csv")
+    corr_df.to_csv(summary_file, index=False)
+    print(f"SUCCESS: Correlation summary saved: {summary_file}")
+
+
+def save_test_results(df_test, y_test, y_test_pred):
+    results = df_test.copy()
+    results["Predicted_Temperature"] = y_test_pred
+    results["Residual"] = y_test - y_test_pred
+    results["Abs_Residual"] = (y_test - y_test_pred).abs()
+    results["R2_Score"] = r2_score(y_test, y_test_pred)
+    results["MAE"] = mean_absolute_error(y_test, y_test_pred)
+
+    save_path = asksaveasfilename(
+        title="Save test set prediction results",
+        defaultextension=".csv",
+        filetypes=[("CSV files", "*.csv")],
+        initialfile="lr_test_results_standard_scaled.csv",
+    )
+    if save_path and not os.path.isdir(save_path):
+        results.to_csv(save_path, index=False)
+        print(f"SUCCESS: Test set prediction results saved: {save_path}")
+    else:
+        print("ERROR: Failed to save test results.")
+
+
+# ---------- Main ----------
+def main():
+    train_val_paths = select_files("Select training and validation data files")
+    df = build_dataset(train_val_paths, include_set=True)
+    if df.empty:
+        print("WARNING: No valid data available for model training.")
+        return
+
+    X = df[FEATURE_COLUMNS]
+    y = df["Temperature"]
+
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
+
+    print("\n[Applying Standard Scaling (Z-score)...]")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    print("SUCCESS: Standard Scaling has been applied.")
+    print_scaling_info(scaler, FEATURE_COLUMNS)
+
+    model = LinearRegression().fit(X_train_scaled, y_train)
+    standardized_correlations = calculate_standardized_correlations(X_train, y_train, FEATURE_COLUMNS)
+
+    test_paths = select_files("Select test data files")
+    df_test = build_dataset(test_paths, include_set=False)
+    if df_test.empty:
+        print("WARNING: No valid test data available.")
+        return
+
+    X_test = df_test[FEATURE_COLUMNS]
+    y_test = df_test["Temperature"]
+    X_test_scaled = scaler.transform(X_test)
+
+    print("\n[Test Results]")
+    y_test_pred = model.predict(X_test_scaled)
+    print_metrics("Test", y_test, y_test_pred)
+
+    run_cross_validation(X.values, y.values)
+    save_correlation_summary(standardized_correlations)
+    save_test_results(df_test, y_test, y_test_pred)
+
+    r2 = r2_score(y_test, y_test_pred)
+    mae = mean_absolute_error(y_test, y_test_pred)
+    print(f"\nScaling: Standard Scaling (Z-score)")
+    print(f"Total {len(standardized_correlations)} features analyzed")
+    print(f"Test performance: R2 = {r2:.4f}, MAE = {mae:.4f}")
+
+
+if __name__ == "__main__":
+    main()
