@@ -1,0 +1,612 @@
+import os
+import re
+import random
+import warnings
+import tkinter as tk
+from tkinter import filedialog
+from tkinter.filedialog import askopenfilenames, asksaveasfilename
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeRegressor
+
+warnings.filterwarnings("ignore")
+
+RANDOM_STATE = 42
+random.seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
+
+plt.rcParams["font.family"] = "Arial"
+plt.rcParams["font.sans-serif"] = ["Arial"]
+plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["figure.figsize"] = (12, 8)
+
+FEATURE_COLUMNS = [
+    "Excitation_ratio",
+    "EmScan_peak_eV",
+    "Em1_peak_eV",
+    "Em2_peak_eV",
+    "Intensity_400nm_div_shoulder",
+]
+DISPLAY_NAMES = {
+    "Excitation_ratio": "Feature (a)",
+    "Intensity_400nm_div_shoulder": "Feature (b)",
+    "EmScan_peak_eV": "Feature (c)",
+    "Em1_peak_eV": "Feature (d)",
+    "Em2_peak_eV": "Feature (e)",
+}
+LRF_PARAMS = dict(n_estimators=100, max_depth=5, min_samples_split=10, min_samples_leaf=5, max_features="sqrt")
+TEMP_RANGE = (25.0, 70.0)  # physical temperature range used to clip leaf predictions
+
+
+# ========== Linear Random Forest (approximate implementation) ==========
+class LinearDecisionTree:
+    """Approximates the M5 algorithm: a standard decision tree with a
+    (Ridge) linear model fitted at each leaf."""
+
+    def __init__(self, max_depth=5, min_samples_split=10, min_samples_leaf=5, random_state=None):
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.random_state = random_state
+        self.tree = None
+        self.linear_models = {}
+
+    def fit(self, X, y):
+        np.random.seed(self.random_state)
+        self.tree = DecisionTreeRegressor(
+            max_depth=self.max_depth,
+            min_samples_split=self.min_samples_split,
+            min_samples_leaf=self.min_samples_leaf,
+            random_state=self.random_state,
+        ).fit(X, y)
+
+        leaf_indices = self.tree.apply(X)
+        for leaf_id in np.unique(leaf_indices):
+            mask = leaf_indices == leaf_id
+            X_leaf, y_leaf = X[mask], y[mask]
+            if len(X_leaf) >= 2:
+                try:
+                    # Ridge regression instead of OLS to prevent coefficient
+                    # explosion caused by near-singular leaf matrices when
+                    # sample count is small (especially during k-fold CV).
+                    # alpha=1.0 provides mild regularization consistent with
+                    # the L2 strength used in the MLP model.
+                    self.linear_models[leaf_id] = Ridge(alpha=1.0).fit(X_leaf, y_leaf)
+                except Exception:
+                    self.linear_models[leaf_id] = np.mean(y_leaf)
+            else:
+                self.linear_models[leaf_id] = np.mean(y_leaf)
+
+    def predict(self, X):
+        leaf_indices = self.tree.apply(X)
+        predictions = np.zeros(len(X))
+        for i, leaf_id in enumerate(leaf_indices):
+            model = self.linear_models.get(leaf_id)
+            if model is None:
+                predictions[i] = self.tree.predict(X[i : i + 1])[0]
+            elif hasattr(model, "predict"):
+                predictions[i] = model.predict(X[i : i + 1])[0]
+            else:
+                predictions[i] = model
+
+        # Clip predictions to the physical temperature range. Prevents
+        # numerically unstable leaf models from producing wildly
+        # extrapolated values, especially in k-fold CV folds whose
+        # validation set extends near the boundary of the training range.
+        return np.clip(predictions, *TEMP_RANGE)
+
+
+class ApproximateLinearRandomForest:
+    """Approximate Linear Random Forest: random sample bipartition
+    (train/pruning) + random feature selection + linear leaf models,
+    averaged across trees (paper's Eq. 5)."""
+
+    def __init__(self, n_estimators=100, max_depth=5, min_samples_split=10,
+                 min_samples_leaf=5, max_features="sqrt", random_state=None):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.max_features = max_features
+        self.random_state = random_state
+        self.estimators_ = []
+        self.feature_importances_ = None
+
+    def _resolve_max_features(self, n_features):
+        if self.max_features == "sqrt":
+            return int(np.sqrt(n_features))
+        if self.max_features == "log2":
+            return int(np.log2(n_features))
+        if isinstance(self.max_features, int):
+            return min(self.max_features, n_features)
+        return n_features
+
+    def fit(self, X, y):
+        np.random.seed(self.random_state)
+        random.seed(self.random_state)
+        y = y.values if hasattr(y, "values") else y
+
+        n_samples, n_features = X.shape
+        self.max_features_ = self._resolve_max_features(n_features)
+
+        print(f"Training Linear Random Forest with {self.n_estimators} trees...")
+        print(f"   - Max features per tree: {self.max_features_}")
+        print("   - Sample bipartition: 80% training, 20% pruning per tree (optimized for small datasets)")
+        print(f"   - Training samples per tree: ~{int(n_samples * 0.8)}")
+        print(f"   - Pruning samples per tree: ~{int(n_samples * 0.2)}")
+
+        for i in range(self.n_estimators):
+            # 1. Random sample bipartition (80% train / 20% pruning)
+            indices = np.random.choice(n_samples, size=n_samples, replace=False)
+            train_size = int(n_samples * 0.8)
+            train_idx, prune_idx = indices[:train_size], indices[train_size:]
+            X_tr, y_tr = X[train_idx], y[train_idx]
+            X_pr, y_pr = X[prune_idx], y[prune_idx]
+
+            # 2. Random feature selection
+            feat_idx = np.random.choice(n_features, size=self.max_features_, replace=False)
+
+            # 3. Linear decision tree on selected features
+            tree = LinearDecisionTree(
+                max_depth=self.max_depth,
+                min_samples_split=self.min_samples_split,
+                min_samples_leaf=self.min_samples_leaf,
+                random_state=self.random_state + i,
+            )
+            tree.fit(X_tr[:, feat_idx], y_tr)
+
+            self.estimators_.append({
+                "tree": tree,
+                "feature_indices": feat_idx,
+                "train_score": r2_score(y_tr, tree.predict(X_tr[:, feat_idx])),
+                "prune_score": r2_score(y_pr, tree.predict(X_pr[:, feat_idx])) if len(X_pr) > 0 else 0,
+            })
+
+            if (i + 1) % 20 == 0:
+                print(f"   - Trained {i + 1}/{self.n_estimators} trees")
+
+        self._calculate_feature_importance(X, y)
+        print("Linear Random Forest training completed!")
+
+    def _calculate_feature_importance(self, X, y):
+        importances = np.zeros(X.shape[1])
+        for est in self.estimators_:
+            base_tree = est["tree"].tree
+            if hasattr(base_tree, "feature_importances_"):
+                for i, feat_idx in enumerate(est["feature_indices"]):
+                    if i < len(base_tree.feature_importances_):
+                        importances[feat_idx] += base_tree.feature_importances_[i]
+        total = importances.sum()
+        self.feature_importances_ = importances / total if total > 0 else importances
+
+    def predict(self, X):
+        predictions = np.column_stack([
+            est["tree"].predict(X[:, est["feature_indices"]]) for est in self.estimators_
+        ])
+        return predictions.mean(axis=1)  # ensemble average (paper's Eq. 5)
+
+    def get_model_info(self):
+        train_scores = [e["train_score"] for e in self.estimators_]
+        prune_scores = [e["prune_score"] for e in self.estimators_]
+        return {
+            "n_estimators": self.n_estimators,
+            "max_depth": self.max_depth,
+            "max_features": self.max_features_,
+            "avg_train_score": np.mean(train_scores),
+            "avg_prune_score": np.mean(prune_scores),
+            "model_type": "Linear Random Forest (Approximate)",
+        }
+
+
+# ========== File I/O and feature extraction ==========
+def select_files(title):
+    root = tk.Tk()
+    root.withdraw()
+    files = askopenfilenames(title=title, filetypes=[("CSV files", "*.csv")])
+    return sorted(files)
+
+
+def read_xy(file):
+    try:
+        df = pd.read_csv(file, header=0, encoding="utf-8")
+    except UnicodeDecodeError:
+        df = pd.read_csv(file, header=0, encoding="cp949")
+    x = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+    y = pd.to_numeric(df.iloc[:, 3], errors="coerce")
+    return x.dropna().values, y.dropna().values
+
+
+def parse_info(file_name):
+    """Extract (set_name, temperature) from a filename, e.g. 'Set1_25.0C'."""
+    m = re.search(r"(Set\d+).*?([0-9]+(?:\.[0-9]+)?)\s*[°º]?\s*[C℃]", file_name)
+    return (m.group(1), float(m.group(2))) if m else ("Unknown", np.nan)
+
+
+def extract_peak_ev(x, y):
+    if len(x) == 0 or len(y) == 0:
+        return np.nan
+    return 1240 / x[np.argmax(y)]
+
+
+def extract_ex_ratio(x, y):
+    main_mask = (x >= 370) & (x <= 380)
+    shoulder_mask = (x >= 340) & (x <= 350)
+    if not main_mask.any() or not shoulder_mask.any():
+        return np.nan
+    return np.max(y[shoulder_mask]) / np.max(y[main_mask])
+
+
+def extract_ratio_400_shoulder(em_x, em_y, ex_x, ex_y):
+    mask = (340 <= ex_x) & (ex_x <= 350)
+    if not mask.any() or len(em_y) == 0:
+        return np.nan
+    return np.max(ex_y[mask]) / np.max(em_y)
+
+
+def build_dataset(paths, include_set=False):
+    """Match each EmScan file to its ExScan/Em(1)/Em(2) counterparts (same
+    set, temperature within 0.2 degC) and compute the five descriptors."""
+    records = []
+    for file in paths:
+        set_name, temp = parse_info(file)
+        if "EmScan" not in file or set_name == "Unknown":
+            continue
+
+        related = lambda tag: [f for f in paths if tag in f and set_name in f]
+        f_ex = next((f for f in related("ExScan") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+        f_em1 = next((f for f in related("Em(1)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+        f_em2 = next((f for f in related("Em(2)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+        if not all([f_ex, f_em1, f_em2]):
+            continue
+
+        try:
+            x_em, y_em = read_xy(file)
+            x_ex, y_ex = read_xy(f_ex)
+            x_em1, y_em1 = read_xy(f_em1)
+            x_em2, y_em2 = read_xy(f_em2)
+
+            temps = [temp, parse_info(f_ex)[1], parse_info(f_em1)[1], parse_info(f_em2)[1]]
+            T_avg = round(np.mean(temps), 2)
+
+            row = {
+                "Temperature": T_avg,
+                "Excitation_ratio": extract_ex_ratio(x_ex, y_ex),
+                "EmScan_peak_eV": extract_peak_ev(x_em, y_em),
+                "Em1_peak_eV": extract_peak_ev(x_em1, y_em1),
+                "Em2_peak_eV": extract_peak_ev(x_em2, y_em2),
+                "Intensity_400nm_div_shoulder": extract_ratio_400_shoulder(x_em, y_em, x_ex, y_ex),
+            }
+            if include_set:
+                row = {"Set": set_name, **row}
+
+            if not any(np.isnan(row[c]) for c in FEATURE_COLUMNS):
+                records.append(row)
+        except Exception as e:
+            print(f"Error processing file: {file}\n   Error: {e}")
+
+    return pd.DataFrame(records)
+
+
+# ========== Reporting ==========
+def print_scaling_info(scaler, feature_names):
+    print("\nStandard Scaling (Z-score) Information:")
+    for i, feature in enumerate(feature_names):
+        print(f"  {feature}: mean = {scaler.mean_[i]:.4f}, std = {scaler.scale_[i]:.4f}")
+
+
+def print_metrics(name, y_true, y_pred):
+    print(f"{name} R2: {r2_score(y_true, y_pred):.4f}, MAE: {mean_absolute_error(y_true, y_pred):.4f}")
+
+
+# ========== Visualization ==========
+def plot_feature_importance(model, feature_names, save_dir=None):
+    print("\n[Visualizing feature importance...]")
+    importances = model.feature_importances_
+    indices = np.argsort(importances)[::-1]
+
+    plt.figure()
+    plt.title("Linear Random Forest Feature Importance", fontsize=16, fontweight="bold")
+    bars = plt.bar(range(len(importances)), importances[indices], alpha=0.8)
+    for bar, color in zip(bars, plt.cm.viridis(np.linspace(0, 1, len(importances)))):
+        bar.set_color(color)
+
+    plt.xlabel("Features", fontsize=12)
+    plt.ylabel("Importance", fontsize=12)
+    labels = [DISPLAY_NAMES.get(feature_names[i], feature_names[i]) for i in indices]
+    plt.xticks(range(len(importances)), labels, rotation=45, ha="right")
+    plt.grid(axis="y", alpha=0.3)
+    for i, v in enumerate(importances[indices]):
+        plt.text(i, v + 0.001, f"{v:.3f}", ha="center", va="bottom", fontsize=10)
+    plt.tight_layout()
+
+    if save_dir:
+        path = os.path.join(save_dir, "lrf_feature_importance_plot.png")
+        plt.savefig(path, dpi=300, bbox_inches="tight")
+        print(f"Feature importance plot saved: {path}")
+    plt.show()
+
+    print("\n[Feature Importance Ranking]")
+    print("-" * 70)
+    print(f"{'Rank':<6}{'Feature Name':<30}{'Display Name':<20}{'Importance':<10}")
+    print("-" * 70)
+    for i, idx in enumerate(indices):
+        name = feature_names[idx]
+        print(f"{i+1:<6}{name:<30}{DISPLAY_NAMES.get(name, name):<20}{importances[idx]:.4f}")
+    print("-" * 70)
+    return importances, indices
+
+
+def plot_2d_decision_boundary(model, X_train, y_train, feature_names, top_features_idx, save_dir=None):
+    print("\n[Visualizing 2D decision boundary...]")
+    f1_idx, f2_idx = top_features_idx[0], top_features_idx[1]
+    f1_name, f2_name = feature_names[f1_idx], feature_names[f2_idx]
+    f1_disp = DISPLAY_NAMES.get(f1_name, f1_name)
+    f2_disp = DISPLAY_NAMES.get(f2_name, f2_name)
+
+    X_2d = X_train[:, [f1_idx, f2_idx]]
+    h = 0.02
+    x_min, x_max = X_2d[:, 0].min() - 1, X_2d[:, 0].max() + 1
+    y_min, y_max = X_2d[:, 1].min() - 1, X_2d[:, 1].max() + 1
+    xx, yy = np.meshgrid(np.arange(x_min, x_max, h), np.arange(y_min, y_max, h))
+
+    n_features = X_train.shape[1]
+    grid_points = np.c_[xx.ravel(), yy.ravel()]
+    full_grid = np.tile(X_train.mean(axis=0), (grid_points.shape[0], 1))
+    full_grid[:, f1_idx] = grid_points[:, 0]
+    full_grid[:, f2_idx] = grid_points[:, 1]
+    Z = model.predict(full_grid).reshape(xx.shape)
+
+    plt.figure()
+    cmap, vmin, vmax = "coolwarm", *TEMP_RANGE
+    plt.contourf(xx, yy, Z, levels=20, alpha=0.7, cmap=cmap, vmin=vmin, vmax=vmax)
+    contour_lines = plt.contour(xx, yy, Z, levels=8, colors="white", alpha=0.8, linewidths=1.5)
+    labels = plt.clabel(contour_lines, inline=True, fontsize=10, fmt="%.0f°C", inline_spacing=5)
+    for label in labels:
+        label.set_fontweight("bold")
+    plt.colorbar(label="Predicted Temperature (°C)")
+    plt.scatter(X_2d[:, 0], X_2d[:, 1], c=y_train, cmap=cmap, vmin=vmin, vmax=vmax,
+                s=80, edgecolor="black", linewidth=1.2, alpha=0.9)
+    plt.xlabel(f"{f1_disp} (Standardized)", fontsize=12)
+    plt.ylabel(f"{f2_disp} (Standardized)", fontsize=12)
+    plt.title(f"Linear Random Forest 2D Decision Boundary\n(Top 2 features: {f1_disp} vs {f2_disp})",
+              fontsize=14, fontweight="bold")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, "lrf_decision_boundary_2d.png")
+        plt.savefig(path, dpi=300, bbox_inches="tight")
+        print(f"2D decision boundary plot saved: {path}")
+    plt.show()
+
+    print("\nDecision boundary explanation:")
+    print(f"- X-axis: {f1_disp} ({f1_name}) - standardized values")
+    print(f"- Y-axis: {f2_disp} ({f2_name}) - standardized values")
+    print("- Points: Training data samples (color = actual temperature)")
+    print("- Background: Linear Random Forest predicted temperature for each region")
+
+
+# ========== Cross-validation ==========
+def run_cross_validation(X, y, n_splits=5):
+    """5-fold CV: LRF re-instantiated with identical hyperparameters per
+    fold; per-fold StandardScaler fitting (train fold only) prevents data
+    leakage."""
+    print("\n" + "=" * 60)
+    print("5-Fold Cross-Validation (LRF)")
+    print("=" * 60)
+
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    mae_list, r2_list = [], []
+
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(X), start=1):
+        X_tr, X_vl = X[tr_idx], X[val_idx]
+        y_tr, y_vl = y[tr_idx], y[val_idx]
+
+        fold_scaler = StandardScaler()
+        X_tr_sc = fold_scaler.fit_transform(X_tr)
+        X_vl_sc = fold_scaler.transform(X_vl)
+
+        fold_model = ApproximateLinearRandomForest(**LRF_PARAMS, random_state=RANDOM_STATE)
+        fold_model.fit(X_tr_sc, y_tr)
+        y_vl_pred = fold_model.predict(X_vl_sc)
+
+        fold_mae = mean_absolute_error(y_vl, y_vl_pred)
+        fold_r2 = r2_score(y_vl, y_vl_pred)
+        mae_list.append(fold_mae)
+        r2_list.append(fold_r2)
+        print(f"  Fold {fold}: MAE = {fold_mae:.4f} °C,  R² = {fold_r2:.4f}")
+
+    print(f"\n  Mean MAE = {np.mean(mae_list):.4f} ± {np.std(mae_list, ddof=1):.4f} °C  (mean ± SD, k={n_splits})")
+    print(f"  Mean R²  = {np.mean(r2_list):.4f} ± {np.std(r2_list, ddof=1):.4f}       (mean ± SD, k={n_splits})")
+    print("=" * 60)
+
+
+# ========== Output ==========
+def save_test_results(df_test, y_test, y_test_pred, model_info):
+    results = df_test.copy()
+    results["Predicted_Temperature"] = y_test_pred
+    results["Residual"] = y_test - y_test_pred
+    results["Abs_Residual"] = (y_test - y_test_pred).abs()
+    results["R2_Score"] = r2_score(y_test, y_test_pred)
+    results["MAE"] = mean_absolute_error(y_test, y_test_pred)
+    results["Model_Type"] = model_info["model_type"]
+    results["N_Estimators"] = model_info["n_estimators"]
+    results["Max_Depth"] = model_info["max_depth"]
+    results["Max_Features"] = model_info["max_features"]
+    results["Avg_Train_Score"] = model_info["avg_train_score"]
+    results["Avg_Prune_Score"] = model_info["avg_prune_score"]
+
+    save_path = asksaveasfilename(
+        title="Save Linear Random Forest test set prediction results",
+        defaultextension=".csv",
+        filetypes=[("CSV files", "*.csv")],
+        initialfile="lrf_test_results_standard_scaled_lrf.csv",
+    )
+    if save_path and not os.path.isdir(save_path):
+        results.to_csv(save_path, index=False, encoding="utf-8-sig")
+        print(f"Linear Random Forest test set prediction results saved: {save_path}")
+    else:
+        print("Failed to save test results.")
+
+
+def save_feature_importance_csv(feature_names, importances, save_dir):
+    df = pd.DataFrame({
+        "Feature": feature_names, "Importance": importances, "Rank": range(1, len(importances) + 1),
+    }).sort_values("Importance", ascending=False)
+    path = os.path.join(save_dir, "lrf_feature_importance.csv")
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"Feature importance CSV saved: {path}")
+
+
+def save_model_info_csv(model, model_info, save_dir):
+    info = {
+        "Parameter": ["n_estimators", "max_depth", "min_samples_split", "min_samples_leaf",
+                      "max_features", "random_state", "model_type", "sample_bipartition",
+                      "avg_train_score", "avg_prune_score"],
+        "Value": [model.n_estimators, model.max_depth, model.min_samples_split, model.min_samples_leaf,
+                  f"sqrt ({model_info['max_features']})", model.random_state, model_info["model_type"],
+                  "80% train, 20% prune", f"{model_info['avg_train_score']:.4f}", f"{model_info['avg_prune_score']:.4f}"],
+        "Description": ["Number of trees", "Maximum depth", "Minimum samples to split",
+                         "Minimum samples in leaf", "Max features per tree", "Random seed",
+                         "Algorithm type", "Sample partitioning strategy",
+                         "Average training score", "Average pruning score"],
+    }
+    path = os.path.join(save_dir, "linear_random_forest_model_info.csv")
+    pd.DataFrame(info).to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"\nModel info saved: {path}")
+
+
+def print_final_summary(model, model_info, feature_names, test_eval):
+    print("\n" + "=" * 60)
+    print("LINEAR RANDOM FOREST MODEL DETAILS")
+    print("=" * 60)
+    print("Model Configuration (Based on Paper):")
+    print("  - Algorithm: Linear Random Forest (Approximate Implementation)")
+    print("  - Sample Bipartition: 80% training, 20% pruning per tree (optimized for small datasets)")
+    print("  - Linear models in leaf nodes (M5-style post-pruning)")
+    print("  - Random feature selection: sqrt(n_features) per tree")
+    print(f"  - Number of trees: {model.n_estimators}")
+    print(f"  - Max depth: {model.max_depth}")
+    print(f"  - Min samples split: {model.min_samples_split}")
+    print(f"  - Min samples leaf: {model.min_samples_leaf}")
+
+    print("\nPerformance Evaluation:")
+    print(f"  - Average Tree Training Score: {model_info['avg_train_score']:.4f}")
+    print(f"  - Average Tree Pruning Score: {model_info['avg_prune_score']:.4f}")
+    if test_eval is not None:
+        y_test, y_test_pred = test_eval
+        print(f"  - Test R2: {r2_score(y_test, y_test_pred):.4f}")
+        print(f"  - Test MAE: {mean_absolute_error(y_test, y_test_pred):.4f}")
+
+    print("\nTop 3 Important Features:")
+    top_3 = sorted(zip(feature_names, model.feature_importances_), key=lambda x: x[1], reverse=True)[:3]
+    for i, (feature, importance) in enumerate(top_3, 1):
+        print(f"  {i}. {feature}: {importance:.4f}")
+
+    print("\nKey Differences from Standard Random Forest:")
+    print("  - Linear models in leaf nodes instead of constant values")
+    print("  - Sample bipartition (80:20) for training and pruning")
+    print("  - Better performance on approximately linear relationships")
+    print("  - Enhanced robustness to data noise and small sample sizes")
+    print("  - Smoother decision boundaries due to linear leaf models")
+
+
+# ========== Main ==========
+def main():
+    print("=" * 60)
+    print("Linear Random Forest Temperature Prediction Model")
+    print("=" * 60)
+
+    print("\n[Step 1: Load Training and Validation Data]")
+    train_val_paths = select_files("Select training and validation data files")
+    if not train_val_paths:
+        print("No files selected. Exiting program.")
+        return
+    print(f"{len(train_val_paths)} files selected.")
+
+    df = build_dataset(train_val_paths, include_set=True)
+    if df.empty:
+        print("No valid data available for model training.")
+        return
+    print(f"\n{len(df)} valid data sets created.")
+
+    X = df[FEATURE_COLUMNS]
+    y = df["Temperature"]
+    feature_names = FEATURE_COLUMNS
+
+    print("\n[Step 2: Data Split]")
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
+    print(f"Training set: {len(X_train)} samples, Validation set: {len(X_val)} samples")
+
+    print("\n[Step 3: Apply Standard Scaling]")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    print("Standard Scaling applied.")
+    print_scaling_info(scaler, feature_names)
+
+    print("\n[Step 4: Linear Random Forest Model Training]")
+    print("Model Configuration (based on the paper):")
+    print("  - Sample Bipartition: 80% training, 20% pruning per tree (optimized for small datasets)")
+    print("  - Linear models in leaf nodes (M5-style post-pruning)")
+    print("  - Random feature selection at each node")
+    for k, v in LRF_PARAMS.items():
+        print(f"  - {k}: {v}")
+
+    lrf_model = ApproximateLinearRandomForest(**LRF_PARAMS, random_state=RANDOM_STATE)
+    lrf_model.fit(X_train_scaled, y_train)
+
+    print("\n[Step 5: Model Evaluation]")
+    model_info = lrf_model.get_model_info()
+    print(f"Average Tree Training Score: {model_info['avg_train_score']:.4f}")
+    print(f"Average Tree Pruning Score: {model_info['avg_prune_score']:.4f}")
+
+    run_cross_validation(X.values, y.values)
+
+    print("\n[Step 6: Visualization]")
+    root = tk.Tk()
+    root.withdraw()
+    viz_save_dir = filedialog.askdirectory(title="Select folder to save visualization results") or None
+    print(f"Visualization save folder: {viz_save_dir}" if viz_save_dir
+          else "No visualization save folder selected. Visualizations will only be displayed.")
+
+    importances, indices = plot_feature_importance(lrf_model, feature_names, viz_save_dir)
+    plot_2d_decision_boundary(lrf_model, X_train_scaled, y_train, feature_names, indices, viz_save_dir)
+    if viz_save_dir:
+        save_feature_importance_csv(feature_names, importances, viz_save_dir)
+
+    print("\n[Step 7: Test Data Processing]")
+    test_paths = select_files("Select test data files")
+    test_eval = None
+    if not test_paths:
+        print("No test files selected.")
+    else:
+        df_test = build_dataset(test_paths, include_set=False)
+        if df_test.empty:
+            print("No valid test data available.")
+        else:
+            X_test_scaled = scaler.transform(df_test[FEATURE_COLUMNS])
+            print("\nStandard Scaling applied to test data")
+            print("\n[Test Results]")
+            y_test = df_test["Temperature"]
+            y_test_pred = lrf_model.predict(X_test_scaled)
+            print_metrics("Test", y_test, y_test_pred)
+
+            print("\n[Step 8: Save Results]")
+            save_test_results(df_test, y_test, y_test_pred, model_info)
+            test_eval = (y_test, y_test_pred)
+
+    print_final_summary(lrf_model, model_info, feature_names, test_eval)
+
+    if viz_save_dir:
+        save_model_info_csv(lrf_model, model_info, viz_save_dir)
+
+
+if __name__ == "__main__":
+    main()
