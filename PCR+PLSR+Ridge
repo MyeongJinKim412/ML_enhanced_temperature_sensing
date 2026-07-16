@@ -1,95 +1,322 @@
-import os
-import re
-import random
-import warnings
 import tkinter as tk
-from tkinter import filedialog
 from tkinter.filedialog import askopenfilenames, asksaveasfilename
-
-import numpy as np
+from tkinter import filedialog, messagebox, simpledialog
 import pandas as pd
-from sklearn.cross_decomposition import PLSRegression
+import numpy as np
+import re
+import os
+import random
+from sklearn.linear_model import Ridge
 from sklearn.decomposition import PCA
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import KFold, train_test_split
 from sklearn.pipeline import Pipeline
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
 
-warnings.filterwarnings("ignore")
+# Set random seed for reproducibility (identical to MLR/SVR/LRF/MLP pipelines)
+random.seed(42)
+np.random.seed(42)
 
-RANDOM_STATE = 42
-random.seed(RANDOM_STATE)
-np.random.seed(RANDOM_STATE)
+# Font settings
+plt.rcParams['font.family'] = 'Arial'
+plt.rcParams['font.sans-serif'] = ['Arial']
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['figure.figsize'] = (12, 8)
 
-FEATURE_COLUMNS = [
-    "Excitation_ratio",
-    "EmScan_peak_eV",
-    "Em1_peak_eV",
-    "Em2_peak_eV",
-    "Intensity_400nm_div_shoulder",
-]
-RIDGE_ALPHA_GRID = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+# ========== Identical file-processing / feature-extraction functions as MLR/SVR/LRF/MLP scripts ==========
 
-
-# ========== File I/O and feature extraction (identical to MLR/SVR/LRF/MLP) ==========
 def select_files(title):
     root = tk.Tk()
     root.withdraw()
     files = askopenfilenames(title=title, filetypes=[("CSV files", "*.csv")])
-    return sorted(files)
-
+    return sorted(list(files))
 
 def read_xy(file):
     try:
-        df = pd.read_csv(file, header=0, encoding="utf-8")
-    except UnicodeDecodeError:
-        df = pd.read_csv(file, header=0, encoding="cp949")
-    x = pd.to_numeric(df.iloc[:, 0], errors="coerce")
-    y = pd.to_numeric(df.iloc[:, 3], errors="coerce")
+        df = pd.read_csv(file, header=0, encoding='utf-8')
+    except:
+        df = pd.read_csv(file, header=0, encoding='cp949')
+    x = pd.to_numeric(df.iloc[:, 0], errors='coerce')
+    y = pd.to_numeric(df.iloc[:, 3], errors='coerce')
     return x.dropna().values, y.dropna().values
 
-
 def parse_info(file_name):
-    """Extract (set_name, temperature) from a filename, e.g. 'Set1_25.0C'."""
-    m = re.search(r"(Set\d+).*?([0-9]+(?:\.[0-9]+)?)\s*[°º]?\s*[C℃]", file_name)
+    m = re.search(r'(Set\d+).*?([0-9]+(?:\.[0-9]+)?)\s*[°º]?\s*[C℃]', file_name)
     return (m.group(1), float(m.group(2))) if m else ("Unknown", np.nan)
-
 
 def extract_peak_ev(x, y):
     if len(x) == 0 or len(y) == 0:
         return np.nan
-    return 1240 / x[np.argmax(y)]
-
+    idx = np.argmax(y)
+    return 1240 / x[idx]
 
 def extract_ex_ratio(x, y):
     main_mask = (x >= 370) & (x <= 380)
     shoulder_mask = (x >= 340) & (x <= 350)
-    if not main_mask.any() or not shoulder_mask.any():
+    if not any(main_mask) or not any(shoulder_mask):
         return np.nan
     return np.max(y[shoulder_mask]) / np.max(y[main_mask])
 
-
 def extract_ratio_400_shoulder(em_x, em_y, ex_x, ex_y):
     mask = (340 <= ex_x) & (ex_x <= 350)
-    if not mask.any() or len(em_y) == 0:
+    if not any(mask) or len(em_y) == 0:
         return np.nan
     return np.max(ex_y[mask]) / np.max(em_y)
 
+def print_scaling_info(scaler, feature_names):
+    print("\nStandard Scaling (Z-score) Information:")
+    for i, feature in enumerate(feature_names):
+        mean = scaler.mean_[i]
+        scale = scaler.scale_[i]
+        print(f"  {feature}: mean = {mean:.4f}, std = {scale:.4f}")
 
-def build_dataset(paths, include_set=False):
-    """Match each EmScan file to its ExScan/Em(1)/Em(2) counterparts (same
-    set, temperature within 0.2 degC) and compute the five descriptors."""
-    records = []
-    for file in paths:
+def print_metrics(name, y_true, y_pred):
+    r2 = r2_score(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    print(f"{name} R2: {r2:.4f}, MAE: {mae:.1f}")
+    return r2, mae
+
+# ========== Model factory functions ==========
+# All three models are built as simple, transparent scikit-learn pipelines so that
+# hyperparameter selection (n_components for PLSR/PCR, alpha for Ridge) can be
+# performed with the identical 5-fold CV procedure used for SVR's (C, epsilon) search.
+
+def build_plsr(n_components):
+    return PLSRegression(n_components=n_components)
+
+def build_pcr(n_components):
+    # PCR = PCA (dimensionality reduction) + ordinary least squares regression,
+    # standard textbook implementation (Hastie et al., 2009, Ch. 3.5.1).
+    return Pipeline([
+        ('pca', PCA(n_components=n_components, random_state=42)),
+        ('lr', LinearRegression())
+    ])
+
+def build_ridge(alpha):
+    return Ridge(alpha=alpha, random_state=42)
+
+# ========== Hyperparameter search via 5-fold CV (mirrors the SVR C/epsilon grid search) ==========
+
+def select_best_hyperparameter(X_arr, y_arr, candidate_values, model_builder, param_name):
+    """
+    For each candidate hyperparameter value, run 5-fold CV (same KFold split,
+    same per-fold StandardScaler fitting on X_train only) and return the value
+    with the lowest mean CV MAE.
+    """
+    print(f"\n[Hyperparameter search: {param_name}]")
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    results = []
+
+    for val in candidate_values:
+        fold_maes = []
+        for tr_idx, val_idx in kf.split(X_arr):
+            X_tr, X_vl = X_arr[tr_idx], X_arr[val_idx]
+            y_tr, y_vl = y_arr[tr_idx], y_arr[val_idx]
+
+            fold_scaler = StandardScaler()
+            X_tr_sc = fold_scaler.fit_transform(X_tr)
+            X_vl_sc = fold_scaler.transform(X_vl)
+
+            model = model_builder(val)
+            model.fit(X_tr_sc, y_tr)
+            y_pred = model.predict(X_vl_sc).ravel()
+            fold_maes.append(mean_absolute_error(y_vl, y_pred))
+
+        mean_mae = np.mean(fold_maes)
+        std_mae = np.std(fold_maes, ddof=1)
+        results.append((val, mean_mae, std_mae))
+        print(f"  {param_name} = {val}: CV MAE = {mean_mae:.1f} ± {std_mae:.1f} °C")
+
+    best_val, best_mae, best_std = min(results, key=lambda r: r[1])
+    print(f"  --> Selected {param_name} = {best_val} (lowest CV MAE = {best_mae:.1f} °C)")
+    return best_val
+
+# ========== 5-fold CV evaluation with the selected hyperparameter (identical procedure to LRF/MLR/SVR) ==========
+
+def run_5fold_cv(X_arr, y_arr, model_builder, hyperparam, model_label):
+    print("\n" + "="*60)
+    print(f"5-Fold Cross-Validation ({model_label})")
+    print("="*60)
+
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    cv_mae_list, cv_r2_list = [], []
+
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(X_arr), start=1):
+        X_tr, X_vl = X_arr[tr_idx], X_arr[val_idx]
+        y_tr, y_vl = y_arr[tr_idx], y_arr[val_idx]
+
+        fold_scaler = StandardScaler()
+        X_tr_sc = fold_scaler.fit_transform(X_tr)
+        X_vl_sc = fold_scaler.transform(X_vl)
+
+        model = model_builder(hyperparam)
+        model.fit(X_tr_sc, y_tr)
+        y_vl_pred = model.predict(X_vl_sc).ravel()
+
+        fold_mae = mean_absolute_error(y_vl, y_vl_pred)
+        fold_r2 = r2_score(y_vl, y_vl_pred)
+        cv_mae_list.append(fold_mae)
+        cv_r2_list.append(fold_r2)
+        print(f"  Fold {fold}: MAE = {fold_mae:.1f} °C,  R² = {fold_r2:.4f}")
+
+    mean_mae, std_mae = np.mean(cv_mae_list), np.std(cv_mae_list, ddof=1)
+    mean_r2, std_r2 = np.mean(cv_r2_list), np.std(cv_r2_list, ddof=1)
+    print(f"\n  Mean MAE = {mean_mae:.1f} ± {std_mae:.1f} °C  (mean ± SD, k=5)")
+    print(f"  Mean R²  = {mean_r2:.4f} ± {std_r2:.4f}       (mean ± SD, k=5)")
+    print("="*60)
+    return mean_mae, std_mae, mean_r2, std_r2
+
+# ========== Main Execution Code ==========
+
+print("="*60)
+print("PLSR / PCR / Ridge Regression Temperature Prediction Models")
+print("(Chemometric baselines requested per reviewer Comment 3)")
+print("="*60)
+
+# 1. Load training and validation data (identical procedure to MLR/SVR/LRF/MLP)
+print("\n[Step 1: Load Training and Validation Data]")
+train_val_paths = select_files("Select training and validation data files")
+
+if not train_val_paths:
+    print("No files selected. Exiting program.")
+    exit()
+
+print(f"{len(train_val_paths)} files selected.")
+
+records = []
+for file in train_val_paths:
+    set_name, temp = parse_info(file)
+    if "EmScan" not in file or set_name == "Unknown":
+        continue
+
+    related = lambda tag: [f for f in train_val_paths if tag in f and set_name in f]
+    f_ex = next((f for f in related("ExScan") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+    f_em1 = next((f for f in related("Em(1)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+    f_em2 = next((f for f in related("Em(2)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+
+    if not all([f_ex, f_em1, f_em2]):
+        continue
+
+    try:
+        x_em, y_em = read_xy(file)
+        x_ex, y_ex = read_xy(f_ex)
+        x_em1, y_em1 = read_xy(f_em1)
+        x_em2, y_em2 = read_xy(f_em2)
+
+        temps = [temp, parse_info(f_ex)[1], parse_info(f_em1)[1], parse_info(f_em2)[1]]
+        T_avg = round(np.mean(temps), 2)
+
+        row = {
+            "Set": set_name,
+            "Temperature": T_avg,
+            "Excitation_ratio": extract_ex_ratio(x_ex, y_ex),
+            "EmScan_peak_eV": extract_peak_ev(x_em, y_em),
+            "Em1_peak_eV": extract_peak_ev(x_em1, y_em1),
+            "Em2_peak_eV": extract_peak_ev(x_em2, y_em2),
+            "Intensity_400nm_div_shoulder": extract_ratio_400_shoulder(x_em, y_em, x_ex, y_ex),
+        }
+
+        if not any(np.isnan(list(row.values())[2:])):
+            records.append(row)
+    except Exception as e:
+        print(f"Error processing file: {file}")
+        print(f"   Error: {str(e)}")
+        continue
+
+df = pd.DataFrame(records)
+if df.empty:
+    print("No valid data available for model training.")
+    exit()
+
+print(f"\n{len(df)} valid data sets created.")
+
+X = df.drop(["Temperature", "Set"], axis=1)
+y = df["Temperature"]
+original_feature_names = X.columns.tolist()
+
+# 2. Train/validation split (80:20) — kept identical to other scripts for consistency.
+#    The primary reported internal metric (as in MLR/SVR/LRF/MLP) is the 5-fold CV below
+#    (run on the full X_arr). X_train/scaler from this split are what the FINAL model
+#    (evaluated on the independent test set in Step 7) is fit on — identical convention
+#    to MLR_kfold.py / SVR_kfold.py / LRF_kfold.py / MLP_kfold.py.
+print("\n[Step 2: Data Split]")
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+print(f"Training set: {len(X_train)} samples, Validation set: {len(X_val)} samples")
+
+print(f"\n[Step 3: Apply Standard Scaling (fit on X_train only)]")
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+print_scaling_info(scaler, original_feature_names)
+
+X_arr = X.values
+y_arr = y.values
+n_features = X_arr.shape[1]
+
+# ========================================================================
+# MODEL 1: Partial Least Squares Regression (PLSR)
+# ========================================================================
+print("\n" + "#"*60)
+print("# MODEL 1: Partial Least Squares Regression (PLSR)")
+print("#"*60)
+
+plsr_components_grid = list(range(1, n_features + 1))  # 1 to 5 (cannot exceed n_features)
+best_plsr_n = select_best_hyperparameter(X_arr, y_arr, plsr_components_grid, build_plsr, "n_components")
+plsr_mae, plsr_mae_sd, plsr_r2, plsr_r2_sd = run_5fold_cv(X_arr, y_arr, build_plsr, best_plsr_n, "PLSR")
+
+# ========================================================================
+# MODEL 2: Principal Component Regression (PCR)
+# ========================================================================
+print("\n" + "#"*60)
+print("# MODEL 2: Principal Component Regression (PCR)")
+print("#"*60)
+
+pcr_components_grid = list(range(1, n_features + 1))  # 1 to 5
+best_pcr_n = select_best_hyperparameter(X_arr, y_arr, pcr_components_grid, build_pcr, "n_components")
+pcr_mae, pcr_mae_sd, pcr_r2, pcr_r2_sd = run_5fold_cv(X_arr, y_arr, build_pcr, best_pcr_n, "PCR")
+
+# ========================================================================
+# MODEL 3: Ridge Regression
+# ========================================================================
+print("\n" + "#"*60)
+print("# MODEL 3: Ridge Regression")
+print("#"*60)
+
+ridge_alpha_grid = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+best_ridge_alpha = select_best_hyperparameter(X_arr, y_arr, ridge_alpha_grid, build_ridge, "alpha")
+ridge_mae, ridge_mae_sd, ridge_r2, ridge_r2_sd = run_5fold_cv(X_arr, y_arr, build_ridge, best_ridge_alpha, "Ridge")
+
+# ========================================================================
+# 7. Test data processing (identical procedure to MLR/SVR/LRF/MLP scripts)
+#    Each of the three models is refit on X_train ONLY (80%), using the scaler
+#    fit on X_train only (Step 3), before being evaluated on the independent
+#    test set — this now matches the MLR/SVR/LRF/MLP convention exactly, so
+#    all seven models are compared on an equal footing (same training-set size).
+# ========================================================================
+print("\n[Step 7: Test Data Processing]")
+test_paths = select_files("Select test data files")
+
+test_results_summary = {}
+
+if not test_paths:
+    print("No test files selected.")
+else:
+    test_records = []
+    for file in test_paths:
         set_name, temp = parse_info(file)
         if "EmScan" not in file or set_name == "Unknown":
             continue
 
-        related = lambda tag: [f for f in paths if tag in f and set_name in f]
+        related = lambda tag: [f for f in test_paths if tag in f and set_name in f]
         f_ex = next((f for f in related("ExScan") if abs(parse_info(f)[1] - temp) <= 0.2), None)
         f_em1 = next((f for f in related("Em(1)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
         f_em2 = next((f for f in related("Em(2)") if abs(parse_info(f)[1] - temp) <= 0.2), None)
+
         if not all([f_ex, f_em1, f_em2]):
             continue
 
@@ -110,289 +337,117 @@ def build_dataset(paths, include_set=False):
                 "Em2_peak_eV": extract_peak_ev(x_em2, y_em2),
                 "Intensity_400nm_div_shoulder": extract_ratio_400_shoulder(x_em, y_em, x_ex, y_ex),
             }
-            if include_set:
-                row = {"Set": set_name, **row}
 
-            if not any(np.isnan(row[c]) for c in FEATURE_COLUMNS):
-                records.append(row)
+            if not any(np.isnan(list(row.values())[1:])):
+                test_records.append(row)
         except Exception as e:
-            print(f"Error processing file: {file}\n   Error: {e}")
+            print(f"Error processing test file: {file}")
+            print(f"   Error: {str(e)}")
+            continue
 
-    return pd.DataFrame(records)
-
-
-def print_scaling_info(scaler, feature_names):
-    print("\nStandard Scaling (Z-score) Information:")
-    for i, feature in enumerate(feature_names):
-        print(f"  {feature}: mean = {scaler.mean_[i]:.4f}, std = {scaler.scale_[i]:.4f}")
-
-
-def print_metrics(name, y_true, y_pred):
-    r2 = r2_score(y_true, y_pred)
-    mae = mean_absolute_error(y_true, y_pred)
-    print(f"{name} R2: {r2:.4f}, MAE: {mae:.1f}")
-    return r2, mae
-
-
-# ========== Model factories ==========
-# All three models are simple, transparent scikit-learn pipelines so that
-# hyperparameter selection (n_components for PLSR/PCR, alpha for Ridge)
-# can use the identical 5-fold CV procedure used for SVR's (C, epsilon) search.
-def build_plsr(n_components):
-    return PLSRegression(n_components=n_components)
-
-
-def build_pcr(n_components):
-    # PCR = PCA (dimensionality reduction) + ordinary least squares,
-    # standard textbook implementation (Hastie et al., 2009, Ch. 3.5.1).
-    return Pipeline([
-        ("pca", PCA(n_components=n_components, random_state=RANDOM_STATE)),
-        ("lr", LinearRegression()),
-    ])
-
-
-def build_ridge(alpha):
-    return Ridge(alpha=alpha, random_state=RANDOM_STATE)
-
-
-# ========== Hyperparameter search via 5-fold CV ==========
-def select_best_hyperparameter(X_arr, y_arr, candidate_values, model_builder, param_name):
-    """For each candidate value, run 5-fold CV (per-fold StandardScaler
-    fitting on X_train only) and return the value with the lowest mean CV
-    MAE."""
-    print(f"\n[Hyperparameter search: {param_name}]")
-    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    results = []
-
-    for val in candidate_values:
-        fold_maes = []
-        for tr_idx, val_idx in kf.split(X_arr):
-            X_tr, X_vl = X_arr[tr_idx], X_arr[val_idx]
-            y_tr, y_vl = y_arr[tr_idx], y_arr[val_idx]
-
-            fold_scaler = StandardScaler()
-            X_tr_sc = fold_scaler.fit_transform(X_tr)
-            X_vl_sc = fold_scaler.transform(X_vl)
-
-            model = model_builder(val).fit(X_tr_sc, y_tr)
-            y_pred = model.predict(X_vl_sc).ravel()
-            fold_maes.append(mean_absolute_error(y_vl, y_pred))
-
-        mean_mae, std_mae = np.mean(fold_maes), np.std(fold_maes, ddof=1)
-        results.append((val, mean_mae, std_mae))
-        print(f"  {param_name} = {val}: CV MAE = {mean_mae:.1f} ± {std_mae:.1f} °C")
-
-    best_val, best_mae, _ = min(results, key=lambda r: r[1])
-    print(f"  --> Selected {param_name} = {best_val} (lowest CV MAE = {best_mae:.1f} °C)")
-    return best_val
-
-
-# ========== 5-fold CV evaluation with the selected hyperparameter ==========
-def run_5fold_cv(X_arr, y_arr, model_builder, hyperparam, model_label):
-    print("\n" + "=" * 60)
-    print(f"5-Fold Cross-Validation ({model_label})")
-    print("=" * 60)
-
-    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    cv_mae_list, cv_r2_list = [], []
-
-    for fold, (tr_idx, val_idx) in enumerate(kf.split(X_arr), start=1):
-        X_tr, X_vl = X_arr[tr_idx], X_arr[val_idx]
-        y_tr, y_vl = y_arr[tr_idx], y_arr[val_idx]
-
-        fold_scaler = StandardScaler()
-        X_tr_sc = fold_scaler.fit_transform(X_tr)
-        X_vl_sc = fold_scaler.transform(X_vl)
-
-        model = model_builder(hyperparam).fit(X_tr_sc, y_tr)
-        y_vl_pred = model.predict(X_vl_sc).ravel()
-
-        fold_mae = mean_absolute_error(y_vl, y_vl_pred)
-        fold_r2 = r2_score(y_vl, y_vl_pred)
-        cv_mae_list.append(fold_mae)
-        cv_r2_list.append(fold_r2)
-        print(f"  Fold {fold}: MAE = {fold_mae:.1f} °C,  R² = {fold_r2:.4f}")
-
-    mean_mae, std_mae = np.mean(cv_mae_list), np.std(cv_mae_list, ddof=1)
-    mean_r2, std_r2 = np.mean(cv_r2_list), np.std(cv_r2_list, ddof=1)
-    print(f"\n  Mean MAE = {mean_mae:.1f} ± {std_mae:.1f} °C  (mean ± SD, k=5)")
-    print(f"  Mean R²  = {mean_r2:.4f} ± {std_r2:.4f}       (mean ± SD, k=5)")
-    print("=" * 60)
-    return mean_mae, std_mae, mean_r2, std_r2
-
-
-# ========== Test evaluation & export ==========
-def evaluate_and_save_test_results(final_models, X_full_scaled, y_arr, df_test, X_test_scaled, y_test):
-    test_results_summary = {}
-    print("\n[Test Results]")
-    for name, (model, hyperparam) in final_models.items():
-        model.fit(X_full_scaled, y_arr)
-        y_test_pred = model.predict(X_test_scaled).ravel()
-        r2, mae = print_metrics(f"{name} (test)", y_test, y_test_pred)
-        test_results_summary[name] = {"hyperparameter": hyperparam, "test_r2": r2, "test_mae": mae}
-
-    for name, (model, hyperparam) in final_models.items():
-        y_test_pred = model.predict(X_test_scaled).ravel()
-        df_out = df_test.copy()
-        df_out["Predicted_Temperature"] = y_test_pred
-        df_out["Residual"] = y_test - y_test_pred
-        df_out["Abs_Residual"] = (y_test - y_test_pred).abs()
-        df_out["Model_Type"] = name
-        df_out["Hyperparameter"] = hyperparam
-        df_out["Test_R2"] = test_results_summary[name]["test_r2"]
-        df_out["Test_MAE"] = test_results_summary[name]["test_mae"]
-
-        save_path = asksaveasfilename(
-            title=f"Save {name} test set prediction results",
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv")],
-            initialfile=f"{name.lower()}_test_results_standard_scaled.csv",
-        )
-        if save_path and not os.path.isdir(save_path):
-            df_out.to_csv(save_path, index=False, encoding="utf-8-sig")
-            print(f"{name} test set prediction results saved: {save_path}")
-
-    return test_results_summary
-
-
-def save_consolidated_summary(cv_results, test_results_summary):
-    rows = []
-    for model, hp_str, mae, mae_sd, r2, r2_sd in cv_results:
-        test = test_results_summary.get(model, {})
-        rows.append({
-            "Model": model, "Hyperparameter": hp_str,
-            "CV_MAE_mean": mae, "CV_MAE_sd": mae_sd, "CV_R2_mean": r2, "CV_R2_sd": r2_sd,
-            "Test_R2": test.get("test_r2", np.nan), "Test_MAE": test.get("test_mae", np.nan),
-        })
-    summary_df = pd.DataFrame(rows)
-
-    # Round for reporting: MAE-type columns to 1 decimal (matches the 0.1 °C
-    # resolution of the temperature-control stage), R2 columns to 4 decimals.
-    mae_cols = ["CV_MAE_mean", "CV_MAE_sd", "Test_MAE"]
-    r2_cols = ["CV_R2_mean", "CV_R2_sd", "Test_R2"]
-    summary_df[mae_cols] = summary_df[mae_cols].round(1)
-    summary_df[r2_cols] = summary_df[r2_cols].round(4)
-
-    print("\n" + "=" * 60)
-    print("SUMMARY: PLSR / PCR / RIDGE REGRESSION")
-    print("=" * 60)
-    print(f"{'Model':<10}{'Hyperparameter':<20}{'CV MAE (°C)':<20}{'CV R2':<20}")
-    print("-" * 70)
-    for _, r in summary_df.iterrows():
-        print(f"{r['Model']:<10}{r['Hyperparameter']:<20}"
-              f"{f'{r.CV_MAE_mean:.1f} ± {r.CV_MAE_sd:.1f}':<20}"
-              f"{f'{r.CV_R2_mean:.4f} ± {r.CV_R2_sd:.4f}':<20}")
-    print("-" * 70)
-
-    if test_results_summary:
-        print("\nIndependent Test Set Results:")
-        for name, res in test_results_summary.items():
-            print(f"  {name}: Test R2 = {res['test_r2']:.4f}, Test MAE = {res['test_mae']:.1f} °C "
-                  f"(hyperparameter = {res['hyperparameter']})")
-
-    root = tk.Tk()
-    root.withdraw()
-    save_dir = filedialog.askdirectory(title="Select folder to save PLSR/PCR/Ridge summary CSV")
-    if save_dir:
-        path = os.path.join(save_dir, "plsr_pcr_ridge_summary.csv")
-        summary_df.to_csv(path, index=False, encoding="utf-8-sig")
-        print(f"\nConsolidated summary CSV saved: {path}")
+    if not test_records:
+        print("No valid test data available.")
     else:
-        print("\nNo save folder selected for summary CSV; summary was only printed above.")
+        df_test = pd.DataFrame(test_records)
+        X_test = df_test.drop(["Temperature"], axis=1)
+        y_test = df_test["Temperature"]
 
+        # Apply the scaler fit on X_train ONLY (Step 3) to the test set — identical
+        # convention to MLR_kfold.py / SVR_kfold.py / LRF_kfold.py / MLP_kfold.py,
+        # which all reuse the X_train-fitted `scaler` for the held-out test transform.
+        X_test_scaled = scaler.transform(X_test.values)
+        print(f"\nStandard Scaling applied to test data (scaler fit on X_train only)")
 
-# ========== Main ==========
-def main():
-    print("=" * 60)
-    print("PLSR / PCR / Ridge Regression Temperature Prediction Models")
-    print("(Chemometric baselines requested per reviewer Comment 3)")
-    print("=" * 60)
+        final_models = {
+            "PLSR": (build_plsr(best_plsr_n), best_plsr_n),
+            "PCR": (build_pcr(best_pcr_n), best_pcr_n),
+            "Ridge": (build_ridge(best_ridge_alpha), best_ridge_alpha),
+        }
 
-    print("\n[Step 1: Load Training and Validation Data]")
-    train_val_paths = select_files("Select training and validation data files")
-    if not train_val_paths:
-        print("No files selected. Exiting program.")
-        return
-    print(f"{len(train_val_paths)} files selected.")
-
-    df = build_dataset(train_val_paths, include_set=True)
-    if df.empty:
-        print("No valid data available for model training.")
-        return
-    print(f"\n{len(df)} valid data sets created.")
-
-    X = df[FEATURE_COLUMNS]
-    y = df["Temperature"]
-
-    # Train/validation split kept for consistency with the other scripts,
-    # although the primary reported metric is the 5-fold CV below.
-    print("\n[Step 2: Data Split]")
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
-    print(f"Training set: {len(X_train)} samples, Validation set: {len(X_val)} samples")
-
-    print("\n[Step 3: Apply Standard Scaling (train/val split, for reference only)]")
-    scaler = StandardScaler()
-    scaler.fit(X_train)
-    print_scaling_info(scaler, FEATURE_COLUMNS)
-
-    X_arr, y_arr = X.values, y.values
-    n_features = X_arr.shape[1]
-    cv_results = []  # (model, hyperparam_str, mae, mae_sd, r2, r2_sd)
-
-    print("\n" + "#" * 60)
-    print("# MODEL 1: Partial Least Squares Regression (PLSR)")
-    print("#" * 60)
-    best_plsr_n = select_best_hyperparameter(X_arr, y_arr, list(range(1, n_features + 1)), build_plsr, "n_components")
-    plsr_mae, plsr_mae_sd, plsr_r2, plsr_r2_sd = run_5fold_cv(X_arr, y_arr, build_plsr, best_plsr_n, "PLSR")
-    cv_results.append(("PLSR", f"n_components={best_plsr_n}", plsr_mae, plsr_mae_sd, plsr_r2, plsr_r2_sd))
-
-    print("\n" + "#" * 60)
-    print("# MODEL 2: Principal Component Regression (PCR)")
-    print("#" * 60)
-    best_pcr_n = select_best_hyperparameter(X_arr, y_arr, list(range(1, n_features + 1)), build_pcr, "n_components")
-    pcr_mae, pcr_mae_sd, pcr_r2, pcr_r2_sd = run_5fold_cv(X_arr, y_arr, build_pcr, best_pcr_n, "PCR")
-    cv_results.append(("PCR", f"n_components={best_pcr_n}", pcr_mae, pcr_mae_sd, pcr_r2, pcr_r2_sd))
-
-    print("\n" + "#" * 60)
-    print("# MODEL 3: Ridge Regression")
-    print("#" * 60)
-    best_ridge_alpha = select_best_hyperparameter(X_arr, y_arr, RIDGE_ALPHA_GRID, build_ridge, "alpha")
-    ridge_mae, ridge_mae_sd, ridge_r2, ridge_r2_sd = run_5fold_cv(X_arr, y_arr, build_ridge, best_ridge_alpha, "Ridge")
-    cv_results.append(("Ridge", f"alpha={best_ridge_alpha}", ridge_mae, ridge_mae_sd, ridge_r2, ridge_r2_sd))
-
-    # Test data: identical procedure to MLR/SVR/LRF/MLP scripts. Each model
-    # is refit on the FULL train/val set (scaler fit on that same set,
-    # not per-CV-fold) before evaluation on the independent test set.
-    print("\n[Step 7: Test Data Processing]")
-    test_paths = select_files("Select test data files")
-    test_results_summary = {}
-
-    if not test_paths:
-        print("No test files selected.")
-    else:
-        df_test = build_dataset(test_paths, include_set=False)
-        if df_test.empty:
-            print("No valid test data available.")
-        else:
-            X_test = df_test[FEATURE_COLUMNS]
-            y_test = df_test["Temperature"]
-
-            final_scaler = StandardScaler()
-            X_full_scaled = final_scaler.fit_transform(X_arr)
-            X_test_scaled = final_scaler.transform(X_test.values)
-            print("\nStandard Scaling applied to test data (scaler fit on full train/val set)")
-
-            final_models = {
-                "PLSR": (build_plsr(best_plsr_n), best_plsr_n),
-                "PCR": (build_pcr(best_pcr_n), best_pcr_n),
-                "Ridge": (build_ridge(best_ridge_alpha), best_ridge_alpha),
+        print("\n[Test Results]")
+        for name, (model, hyperparam) in final_models.items():
+            # Fit on X_train_scaled / y_train (80%) only — matches the core 4 models,
+            # rather than X_full_scaled / y_arr (100%) as in the previous version.
+            model.fit(X_train_scaled, y_train)
+            y_test_pred = model.predict(X_test_scaled).ravel()
+            r2, mae = print_metrics(f"{name} (test)", y_test, y_test_pred)
+            test_results_summary[name] = {
+                "hyperparameter": hyperparam,
+                "test_r2": r2,
+                "test_mae": mae
             }
-            test_results_summary = evaluate_and_save_test_results(
-                final_models, X_full_scaled, y_arr, df_test, X_test_scaled, y_test
+
+        # Save per-model test predictions
+        for name, (model, hyperparam) in final_models.items():
+            y_test_pred = model.predict(X_test_scaled).ravel()
+            df_out = df_test.copy()
+            df_out["Predicted_Temperature"] = y_test_pred
+            df_out["Residual"] = y_test - y_test_pred
+            df_out["Abs_Residual"] = abs(y_test - y_test_pred)
+            df_out["Model_Type"] = name
+            df_out["Hyperparameter"] = hyperparam
+            df_out["Test_R2"] = test_results_summary[name]["test_r2"]
+            df_out["Test_MAE"] = test_results_summary[name]["test_mae"]
+
+            save_path = asksaveasfilename(
+                title=f"Save {name} test set prediction results",
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv")],
+                initialfile=f"{name.lower()}_test_results_standard_scaled.csv"
             )
+            if save_path and not os.path.isdir(save_path):
+                df_out.to_csv(save_path, index=False, encoding='utf-8-sig')
+                print(f"{name} test set prediction results saved: {save_path}")
 
-    save_consolidated_summary(cv_results, test_results_summary)
+# ========================================================================
+# Final summary (mirrors the summary block in the LRF script)
+# ========================================================================
+print("\n" + "="*60)
+print("SUMMARY: PLSR / PCR / RIDGE REGRESSION")
+print("="*60)
+print(f"{'Model':<10}{'Hyperparameter':<20}{'CV MAE (°C)':<20}{'CV R2':<20}")
+print("-"*70)
+print(f"{'PLSR':<10}{'n_components='+str(best_plsr_n):<20}{f'{plsr_mae:.1f} ± {plsr_mae_sd:.1f}':<20}{f'{plsr_r2:.4f} ± {plsr_r2_sd:.4f}':<20}")
+print(f"{'PCR':<10}{'n_components='+str(best_pcr_n):<20}{f'{pcr_mae:.1f} ± {pcr_mae_sd:.1f}':<20}{f'{pcr_r2:.4f} ± {pcr_r2_sd:.4f}':<20}")
+print(f"{'Ridge':<10}{'alpha='+str(best_ridge_alpha):<20}{f'{ridge_mae:.1f} ± {ridge_mae_sd:.1f}':<20}{f'{ridge_r2:.4f} ± {ridge_r2_sd:.4f}':<20}")
+print("-"*70)
 
+if test_results_summary:
+    print("\nIndependent Test Set Results:")
+    for name, res in test_results_summary.items():
+        print(f"  {name}: Test R2 = {res['test_r2']:.4f}, Test MAE = {res['test_mae']:.1f} °C "
+              f"(hyperparameter = {res['hyperparameter']})")
 
-if __name__ == "__main__":
-    main()
+# Save a consolidated summary CSV for direct use in Table S4 / Figure 5c
+summary_rows = [
+    {"Model": "PLSR", "Hyperparameter": f"n_components={best_plsr_n}",
+     "CV_MAE_mean": plsr_mae, "CV_MAE_sd": plsr_mae_sd, "CV_R2_mean": plsr_r2, "CV_R2_sd": plsr_r2_sd,
+     "Test_R2": test_results_summary.get("PLSR", {}).get("test_r2", np.nan),
+     "Test_MAE": test_results_summary.get("PLSR", {}).get("test_mae", np.nan)},
+    {"Model": "PCR", "Hyperparameter": f"n_components={best_pcr_n}",
+     "CV_MAE_mean": pcr_mae, "CV_MAE_sd": pcr_mae_sd, "CV_R2_mean": pcr_r2, "CV_R2_sd": pcr_r2_sd,
+     "Test_R2": test_results_summary.get("PCR", {}).get("test_r2", np.nan),
+     "Test_MAE": test_results_summary.get("PCR", {}).get("test_mae", np.nan)},
+    {"Model": "Ridge", "Hyperparameter": f"alpha={best_ridge_alpha}",
+     "CV_MAE_mean": ridge_mae, "CV_MAE_sd": ridge_mae_sd, "CV_R2_mean": ridge_r2, "CV_R2_sd": ridge_r2_sd,
+     "Test_R2": test_results_summary.get("Ridge", {}).get("test_r2", np.nan),
+     "Test_MAE": test_results_summary.get("Ridge", {}).get("test_mae", np.nan)},
+]
+summary_df = pd.DataFrame(summary_rows)
+
+# Round for reporting: temperature/MAE-type columns to 1 decimal place (matches the
+# 0.1 °C resolution of the temperature-control stage), R2 columns to 4 decimal places.
+mae_cols = ["CV_MAE_mean", "CV_MAE_sd", "Test_MAE"]
+r2_cols = ["CV_R2_mean", "CV_R2_sd", "Test_R2"]
+summary_df[mae_cols] = summary_df[mae_cols].round(1)
+summary_df[r2_cols] = summary_df[r2_cols].round(4)
+
+root = tk.Tk()
+root.withdraw()
+summary_save_dir = filedialog.askdirectory(title="Select folder to save PLSR/PCR/Ridge summary CSV")
+if summary_save_dir:
+    summary_path = os.path.join(summary_save_dir, "plsr_pcr_ridge_summary.csv")
+    summary_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
+    print(f"\nConsolidated summary CSV saved: {summary_path}")
+else:
+    print("\nNo save folder selected for summary CSV; summary was only printed above.")
